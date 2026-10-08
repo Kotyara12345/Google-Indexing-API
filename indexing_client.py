@@ -9,6 +9,7 @@ from pathlib import Path
 
 import httplib2
 from google.oauth2 import service_account
+from google_auth_httplib2 import AuthorizedHttp
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import BatchHttpRequest
@@ -106,12 +107,6 @@ def _is_quota_error(exception: Exception) -> bool:
     """
     True, если ошибка указывает на исчерпание квоты.
 
-    Приоритет:
-      1. HttpError.resp.status == 429,
-      2. error_details / error.status == RESOURCE_EXHAUSTED
-         или RATE_LIMIT_EXCEEDED,
-      3. текстовые маркеры (нужны для BatchError).
-
     403 сознательно НЕ считается квотой: он обычно означает
     PERMISSION_DENIED (нет прав в Search Console), а не лимит.
     """
@@ -170,7 +165,11 @@ class IndexingClient:
         creds = service_account.Credentials.from_service_account_file(
             self._key_path, scopes=SCOPES
         )
-        http = creds.authorize(httplib2.Http(timeout=self._http_timeout))
+        # AuthorizedHttp оборачивает httplib2.Http и подписывает запросы
+        # токеном из google-auth. Именно этот класс предоставляет
+        # совместимый с googleapiclient интерфейс транспорта.
+        plain_http = httplib2.Http(timeout=self._http_timeout)
+        http = AuthorizedHttp(creds, http=plain_http)
         service = build("indexing", "v3", http=http, cache_discovery=False)
         return _ThreadContext(service, http)
 
@@ -253,12 +252,11 @@ class IndexingClient:
             results.clear()
             quota_state = {"hit": False}
 
-            # Явно передаём http в BatchHttpRequest, чтобы он не
-            # использовал глобальный транспорт по умолчанию.
+            # Конструктор BatchHttpRequest не принимает http —
+            # транспорт передаётся в execute(http=...).
             batch = BatchHttpRequest(
                 callback=make_callback(quota_state),
                 batch_uri=BATCH_URI,
-                http=http,
             )
             for url in urls:
                 req = service.urlNotifications().publish(
@@ -268,7 +266,7 @@ class IndexingClient:
 
             transport_error = False
             try:
-                batch.execute()
+                batch.execute(http=http)
             except socket.timeout as e:
                 for u in urls:
                     results.setdefault(u, (False, f"Socket timeout: {e}"))
@@ -360,9 +358,6 @@ class IndexingClient:
                 return False, f"Socket timeout: {e}"
             except HttpError as e:
                 if _is_quota_error(e):
-                    # Ставим явный маркер, чтобы внешний чек
-                    # _is_quota_error_message(info) сработал даже
-                    # если тело ошибки Google нестандартное.
                     if attempt == last:
                         return False, f"RATE_LIMIT_EXCEEDED: {e}"
                     continue
@@ -376,10 +371,6 @@ class IndexingClient:
 
     @staticmethod
     def _sleep_with_cancel(seconds: float, cancel):
-        """
-        Event.wait(timeout) просыпается сразу при cancel.set(),
-        в отличие от цикла time.sleep(0.2).
-        """
         if cancel is None:
             time.sleep(seconds)
             return
